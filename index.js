@@ -2,6 +2,9 @@ const express = require("express");
 const { chromium } = require("playwright");
 const mysql = require("mysql2");
 
+
+ 
+
 const app = express();
 app.use(express.json());
 
@@ -27,7 +30,10 @@ async function scrapeEpisodes() {
     db.query("SELECT * FROM episodes", async (err, results) => {
       if (err) return reject(err);
 
-      const browser = await chromium.launch({ headless: true });
+      const browser = await chromium.launch({
+  headless: true,
+  args: ["--no-sandbox", "--disable-setuid-sandbox"]
+});   
       const page = await browser.newPage();
 
       for (const episode of results) {
