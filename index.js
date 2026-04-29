@@ -6,7 +6,7 @@ const app = express();
 app.use(express.json());
 
 // =====================
-// DB CONNECTION
+// DB
 // =====================
 const db = mysql.createConnection({
   host: process.env.MYSQLHOST,
@@ -31,11 +31,20 @@ let isScraping = false;
 let browserReady = false;
 
 // =====================
-// SAFE BROWSER LAUNCH (AUTO RECOVERY)
+// SAFE LOGGER (prevents Railway log spam)
+// =====================
+const log = (...args) => {
+  if (process.env.NODE_ENV !== "production") {
+    console.log(...args);
+  }
+};
+
+// =====================
+// BROWSER INIT (AUTO RECOVERY)
 // =====================
 async function initBrowser() {
   try {
-    console.log("🚀 Starting browser...");
+    log("🚀 Launching browser...");
 
     browser = await chromium.launch({
       headless: true,
@@ -49,9 +58,9 @@ async function initBrowser() {
     });
 
     browserReady = true;
-    console.log("✅ Browser ready");
+    log("✅ Browser ready");
   } catch (err) {
-    console.error("❌ Browser failed:", err.message);
+    console.error("❌ Browser launch failed:", err.message);
     browserReady = false;
 
     setTimeout(initBrowser, 5000);
@@ -61,12 +70,11 @@ async function initBrowser() {
 initBrowser();
 
 // =====================
-// SAFE BROWSER GETTER (FIX FOR YOUR ERROR)
+// SAFE BROWSER GETTER
 // =====================
 async function getBrowser() {
   if (!browser || !browser.isConnected?.()) {
-    console.log("♻️ Browser was closed → restarting...");
-
+    console.log("♻️ Browser restarted...");
     browserReady = false;
     await initBrowser();
   }
@@ -75,18 +83,11 @@ async function getBrowser() {
 }
 
 // =====================
-// SCRAPER CORE
+// SCRAPER CORE (FIXED EPISODE SKIPPING ISSUE)
 // =====================
 async function scrapeEpisodes() {
-  if (isScraping) {
-    console.log("Scraper already running...");
-    return;
-  }
-
-  if (!browserReady) {
-    console.log("Browser not ready");
-    return;
-  }
+  if (isScraping) return;
+  if (!browserReady) return;
 
   isScraping = true;
 
@@ -109,7 +110,6 @@ async function scrapeEpisodes() {
       try {
         const safeBrowser = await getBrowser();
 
-        // 🔥 FIX HERE (prevents your crash)
         page = await safeBrowser.newPage();
 
         console.log(`Scraping ${episode.animeId}`);
@@ -123,6 +123,9 @@ async function scrapeEpisodes() {
           timeout: 15000,
         });
 
+        // =========================
+        // FIX: STABLE SERVER LOOP
+        // =========================
         const serverCount = await page.$$eval(
           "#episode-servers > li",
           els => els.length
@@ -131,10 +134,14 @@ async function scrapeEpisodes() {
         let serversLinks = [];
 
         for (let i = 0; i < serverCount; i++) {
-          const servers = await page.$$("#episode-servers > li");
-          if (!servers[i]) continue;
 
-          await servers[i].click();
+          // 🔥 ALWAYS RE-FETCH ELEMENTS (fix skip issue)
+          const servers = await page.$$("#episode-servers > li");
+          const server = servers[i];
+
+          if (!server) continue;
+
+          await server.click();
 
           await page.waitForSelector("#iframe-container > iframe", {
             timeout: 15000,
@@ -179,11 +186,14 @@ async function scrapeEpisodes() {
 
             if (videoLink) serversLinks.push(videoLink);
           }
+
+          // small delay → prevents DOM race issues
+          await new Promise(r => setTimeout(r, 700));
         }
 
-        // =====================
+        // =========================
         // INSERT DB (NO DUPLICATES)
-        // =====================
+        // =========================
         if (serversLinks.length > 0) {
           const values = serversLinks.map(link => [
             episode.id,
@@ -202,8 +212,7 @@ async function scrapeEpisodes() {
 
         await page.close();
 
-        // small delay (IMPORTANT for Railway stability)
-        await new Promise(r => setTimeout(r, 800));
+        await new Promise(r => setTimeout(r, 1000));
 
       } catch (error) {
         console.error("Scrape error:", error.message);
@@ -214,7 +223,7 @@ async function scrapeEpisodes() {
           } catch {}
         }
 
-        // 🔥 FIX: browser died → restart it
+        // browser recovery
         if (error.message.includes("Target browser")) {
           browserReady = false;
           await initBrowser();
@@ -228,14 +237,14 @@ async function scrapeEpisodes() {
 }
 
 // =====================
-// API ROUTES
+// API
 // =====================
 app.get("/scrape", (req, res) => {
   scrapeEpisodes();
 
   res.json({
     success: true,
-    message: "Scraping started in background 🚀",
+    message: "Scraping started 🚀",
   });
 });
 
@@ -246,9 +255,6 @@ app.get("/status", (req, res) => {
   });
 });
 
-// =====================
-// HEALTH CHECK
-// =====================
 app.get("/", (req, res) => {
   res.send("OK");
 });
