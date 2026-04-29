@@ -23,136 +23,62 @@ db.connect(err => {
   console.log("Connected to MySQL");
 });
 
-// =====================
-// GLOBAL STATE
-// =====================
-let browser = null;
+// ---------------- SCRAPER LOCK ----------------
 let isScraping = false;
-let browserReady = false;
 
-// =====================
-// SAFE LOGGER (prevents Railway log spam)
-// =====================
-const log = (...args) => {
-  if (process.env.NODE_ENV !== "production") {
-    console.log(...args);
+// ---------------- SCRAPER ----------------
+async function runScraper() {
+  if (isScraping) {
+    console.log("Scraper already running...");
+    return;
   }
-};
-
-// =====================
-// BROWSER INIT (AUTO RECOVERY)
-// =====================
-async function initBrowser() {
-  try {
-    log("🚀 Launching browser...");
-
-    browser = await chromium.launch({
-      headless: true,
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--no-zygote",
-        "--single-process",
-      ],
-    });
-
-    browserReady = true;
-    log("✅ Browser ready");
-  } catch (err) {
-    console.error("❌ Browser launch failed:", err.message);
-    browserReady = false;
-
-    setTimeout(initBrowser, 5000);
-  }
-}
-
-initBrowser();
-
-// =====================
-// SAFE BROWSER GETTER
-// =====================
-async function getBrowser() {
-  if (!browser || !browser.isConnected?.()) {
-    console.log("♻️ Browser restarted...");
-    browserReady = false;
-    await initBrowser();
-  }
-
-  return browser;
-}
-
-// =====================
-// SCRAPER CORE (FIXED EPISODE SKIPPING ISSUE)
-// =====================
-async function scrapeEpisodes() {
-  if (isScraping) return;
-  if (!browserReady) return;
 
   isScraping = true;
 
-  db.query("SELECT * FROM episodes", async (err, results) => {
-    if (err) {
-      console.error("DB error:", err.message);
-      isScraping = false;
-      return;
-    }
+  let browser;
 
-    if (!results.length) {
-      console.log("No episodes found");
-      isScraping = false;
-      return;
-    }
+  try {
+    console.log("Starting scraper...");
+
+    browser = await chromium.launch({
+      headless: true,
+      args: ["--no-sandbox", "--disable-setuid-sandbox"], // IMPORTANT for Railway
+    });
+
+    const page = await browser.newPage();
+
+    const results = await new Promise((resolve, reject) => {
+      db.query("SELECT * FROM episodes", (err, rows) => {
+        if (err) reject(err);
+        else resolve(rows);
+      });
+    });
 
     for (const episode of results) {
-      let page;
+      console.log(`Scraping anime ${episode.animeId} | ${episode.episodeHref}`);
 
       try {
-        const safeBrowser = await getBrowser();
+        await page.goto(episode.episodeHref, { waitUntil: "networkidle" });
 
-        page = await safeBrowser.newPage();
+        await page.waitForSelector("#episode-servers > li", { timeout: 15000 });
 
-        console.log(`Scraping ${episode.animeId}`);
-
-        await page.goto(episode.episodeHref, {
-          waitUntil: "domcontentloaded",
-          timeout: 60000,
-        });
-
-        await page.waitForSelector("#episode-servers > li", {
-          timeout: 15000,
-        });
-
-        // =========================
-        // FIX: STABLE SERVER LOOP
-        // =========================
-        const serverCount = await page.$$eval(
-          "#episode-servers > li",
-          els => els.length
-        );
+        const serverCount = await page.$$eval("#episode-servers > li", els => els.length);
 
         let serversLinks = [];
 
         for (let i = 0; i < serverCount; i++) {
+          console.log(`Clicking server ${i + 1}`);
 
-          // 🔥 ALWAYS RE-FETCH ELEMENTS (fix skip issue)
           const servers = await page.$$("#episode-servers > li");
-          const server = servers[i];
+          await servers[i].click();
 
-          if (!server) continue;
-
-          await server.click();
-
-          await page.waitForSelector("#iframe-container > iframe", {
-            timeout: 15000,
-          });
+          await page.waitForSelector("#iframe-container > iframe", { timeout: 15000 });
 
           const frameHandle = await page.$("#iframe-container > iframe");
           const frame = await frameHandle?.contentFrame();
-
           if (!frame) continue;
 
-          await frame.waitForTimeout(1000);
+          await frame.waitForTimeout(2000);
 
           const playerSelector =
             "#PlayerDisplay > div.OptionsLangDisp > div > div > li";
@@ -160,40 +86,34 @@ async function scrapeEpisodes() {
           const hasList = await frame.$(playerSelector);
 
           if (hasList) {
-            const encodedList = await frame.$$eval(
-              playerSelector,
-              items =>
-                items
-                  .map(item => {
-                    const onclick = item.getAttribute("onclick");
-                    const match = onclick?.match(/go_to_player\('([^']+)'\)/);
-                    return match ? match[1] : null;
-                  })
-                  .filter(Boolean)
+            const encodedList = await frame.$$eval(playerSelector, items =>
+              items
+                .map(item => {
+                  const onclick = item.getAttribute("onclick");
+                  if (!onclick) return null;
+
+                  const match = onclick.match(/go_to_player\('([^']+)'\)/);
+                  return match ? match[1] : null;
+                })
+                .filter(Boolean)
             );
 
-            const decoded = encodedList.map(e =>
-              Buffer.from(e, "base64").toString("utf-8")
+            const decodedList = encodedList.map(encoded =>
+              Buffer.from(encoded, "base64").toString("utf-8")
             );
 
-            serversLinks.push(...decoded);
+            serversLinks.push(...decodedList);
           } else {
-            const videoLink = await frame
-              .$eval("video", v =>
-                v.src || v.currentSrc || v.getAttribute("src")
-              )
-              .catch(() => null);
+            const videoLink = await frame.$eval("video", video =>
+              video.src || video.currentSrc || video.getAttribute("src")
+            ).catch(() => null);
 
             if (videoLink) serversLinks.push(videoLink);
           }
-
-          // small delay → prevents DOM race issues
-          await new Promise(r => setTimeout(r, 700));
         }
 
-        // =========================
-        // INSERT DB (NO DUPLICATES)
-        // =========================
+        console.log("FINAL LINKS:", serversLinks);
+
         if (serversLinks.length > 0) {
           const values = serversLinks.map(link => [
             episode.id,
@@ -202,68 +122,48 @@ async function scrapeEpisodes() {
           ]);
 
           db.query(
-            "INSERT IGNORE INTO servers (episodeId, serverLink, animeId) VALUES ?",
+            "INSERT INTO servers (episodeId, serverLink, animeId) VALUES ?",
             [values],
             err => {
-              if (err) console.error("Insert error:", err.message);
+              if (err) console.error("Insert error:", err);
+              else console.log(`Inserted ${values.length} links`);
             }
           );
         }
-
-        await page.close();
-
-        await new Promise(r => setTimeout(r, 1000));
-
-      } catch (error) {
-        console.error("Scrape error:", error.message);
-
-        if (page) {
-          try {
-            await page.close();
-          } catch {}
-        }
-
-        // browser recovery
-        if (error.message.includes("Target browser")) {
-          browserReady = false;
-          await initBrowser();
-        }
+      } catch (err) {
+        console.error("Scrape error:", episode.animeId, err.message);
       }
     }
 
-    console.log("Scraping completed");
+    console.log("Scraping finished.");
+  } catch (err) {
+    console.error("Fatal scraper error:", err);
+  } finally {
+    if (browser) await browser.close();
     isScraping = false;
-  });
+  }
 }
 
-// =====================
-// API
-// =====================
-app.get("/scrape", (req, res) => {
-  scrapeEpisodes();
+// ---------------- ROUTES ----------------
 
-  res.json({
-    success: true,
-    message: "Scraping started 🚀",
-  });
-});
-
-app.get("/status", (req, res) => {
-  res.json({
-    scraping: isScraping,
-    browserReady,
-  });
-});
-
+// health check
 app.get("/", (req, res) => {
-  res.send("OK");
+  res.send("Scraper server is running 🚀");
 });
 
-// =====================
-// START SERVER
-// =====================
-const PORT = process.env.PORT || 3000;
+// trigger scraper manually
+app.get("/scrape", async (req, res) => {
+  runScraper();
+  res.json({ status: "Scraping started" });
+});
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log("Server running on port", PORT);
+// optional auto scrape on start
+app.get("/scrape-once", async (req, res) => {
+  await runScraper();
+  res.json({ status: "Scraping finished" });
+});
+
+// ---------------- START SERVER ----------------
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
 });
