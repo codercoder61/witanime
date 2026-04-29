@@ -6,7 +6,7 @@ const app = express();
 app.use(express.json());
 
 // =====================
-// DB CONNECTION
+// DB CONNECTION (SAFE)
 // =====================
 const db = mysql.createConnection({
   host: process.env.MYSQLHOST,
@@ -17,7 +17,7 @@ const db = mysql.createConnection({
 
 db.connect(err => {
   if (err) {
-    console.error("DB connection error:", err);
+    console.error("DB connection error:", err.message);
     return;
   }
   console.log("Connected to MySQL");
@@ -28,188 +28,198 @@ db.connect(err => {
 // =====================
 let browser = null;
 let isScraping = false;
+let browserReady = false;
 
 // =====================
-// INIT BROWSER (REUSED)
+// SAFE LOGGER (prevents Railway log spam)
 // =====================
-(async () => {
-  browser = await chromium.launch({
-    headless: true,
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-gpu",
-      "--no-zygote",
-      "--single-process"
-    ],
-  });
-
-  console.log("Browser launched");
-})();
+const log = (...args) => {
+  if (process.env.NODE_ENV !== "production") {
+    console.log(...args);
+  }
+};
 
 // =====================
-// SCRAPER CORE
+// INIT BROWSER (REUSED + AUTO RECOVERY)
+// =====================
+async function initBrowser() {
+  try {
+    log("🚀 Starting browser...");
+
+    browser = await chromium.launch({
+      headless: true,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--no-zygote",
+        "--single-process",
+      ],
+    });
+
+    browserReady = true;
+    log("✅ Browser ready");
+  } catch (err) {
+    console.error("❌ Browser launch failed:", err.message);
+    browserReady = false;
+
+    setTimeout(initBrowser, 5000); // retry
+  }
+}
+
+initBrowser();
+
+// =====================
+// SCRAPER CORE (FIXED)
 // =====================
 async function scrapeEpisodes() {
   if (isScraping) {
-    console.log("Scraper already running...");
+    log("Scraper already running...");
+    return;
+  }
+
+  if (!browserReady || !browser) {
+    console.log("Browser not ready yet");
     return;
   }
 
   isScraping = true;
 
   try {
-    db.query(
-      "SELECT * FROM episodes",
-      async (err, results) => {
-        if (err) {
-          console.error(err);
-          isScraping = false;
-          return;
-        }
+    db.query("SELECT * FROM episodes", async (err, results) => {
+      if (err) {
+        console.error("DB error:", err.message);
+        isScraping = false;
+        return;
+      }
 
-        if (!results.length) {
-          console.log("No episodes to scrape");
-          isScraping = false;
-          return;
-        }
+      if (!results.length) {
+        console.log("No episodes to scrape");
+        isScraping = false;
+        return;
+      }
 
-        for (const episode of results) {
-          console.log(
-            `Scraping anime ${episode.animeId} | ${episode.episodeHref}`
+      for (const episode of results) {
+        let page;
+
+        try {
+          log(`Scraping ${episode.animeId}`);
+
+          page = await browser.newPage();
+
+          await page.goto(episode.episodeHref, {
+            waitUntil: "domcontentloaded",
+            timeout: 60000,
+          });
+
+          await page.waitForSelector("#episode-servers > li", {
+            timeout: 15000,
+          });
+
+          const serverCount = await page.$$eval(
+            "#episode-servers > li",
+            els => els.length
           );
 
-          let page;
+          let serversLinks = [];
 
-          try {
-            page = await browser.newPage();
+          for (let i = 0; i < serverCount; i++) {
+            const servers = await page.$$("#episode-servers > li");
+            if (!servers[i]) continue;
 
-            await page.goto(episode.episodeHref, {
-              waitUntil: "domcontentloaded",
-              timeout: 30000,
+            await servers[i].click();
+
+            await page.waitForSelector("#iframe-container > iframe", {
+              timeout: 15000,
             });
 
-            await page.waitForSelector("#episode-servers > li", {
-              timeout: 10000,
-            });
+            const frameHandle = await page.$("#iframe-container > iframe");
+            const frame = await frameHandle?.contentFrame();
 
-            const serverCount = await page.$$eval(
-              "#episode-servers > li",
-              els => els.length
-            );
+            if (!frame) continue;
 
-            let serversLinks = [];
+            await frame.waitForTimeout(1000);
 
-            for (let i = 0; i < serverCount; i++) {
-              const servers = await page.$$("#episode-servers > li");
+            const playerSelector =
+              "#PlayerDisplay > div.OptionsLangDisp > div > div > li";
 
-              if (!servers[i]) continue;
+            const hasList = await frame.$(playerSelector);
 
-              await servers[i].click();
-
-              await page.waitForSelector("#iframe-container > iframe", {
-                timeout: 10000,
-              });
-
-              const frameHandle = await page.$(
-                "#iframe-container > iframe"
+            if (hasList) {
+              const encodedList = await frame.$$eval(
+                playerSelector,
+                items =>
+                  items
+                    .map(item => {
+                      const onclick = item.getAttribute("onclick");
+                      const match = onclick?.match(/go_to_player\('([^']+)'\)/);
+                      return match ? match[1] : null;
+                    })
+                    .filter(Boolean)
               );
 
-              const frame = await frameHandle?.contentFrame();
-              if (!frame) continue;
+              const decoded = encodedList.map(e =>
+                Buffer.from(e, "base64").toString("utf-8")
+              );
 
-              await frame.waitForTimeout(1500);
+              serversLinks.push(...decoded);
+            } else {
+              const videoLink = await frame
+                .$eval("video", v =>
+                  v.src || v.currentSrc || v.getAttribute("src")
+                )
+                .catch(() => null);
 
-              const playerSelector =
-                "#PlayerDisplay > div.OptionsLangDisp > div > div > li";
-
-              const hasList = await frame.$(playerSelector);
-
-              if (hasList) {
-                const encodedList = await frame.$$eval(
-                  playerSelector,
-                  items =>
-                    items
-                      .map(item => {
-                        const onclick = item.getAttribute("onclick");
-                        if (!onclick) return null;
-
-                        const match = onclick.match(
-                          /go_to_player\('([^']+)'\)/
-                        );
-                        return match ? match[1] : null;
-                      })
-                      .filter(Boolean)
-                );
-
-                const decodedList = encodedList.map(encoded =>
-                  Buffer.from(encoded, "base64").toString("utf-8")
-                );
-
-                serversLinks.push(...decodedList);
-              } else {
-                const videoLink = await frame
-                  .$eval("video", video =>
-                    video.src ||
-                    video.currentSrc ||
-                    video.getAttribute("src")
-                  )
-                  .catch(() => null);
-
-                if (videoLink) serversLinks.push(videoLink);
-              }
+              if (videoLink) serversLinks.push(videoLink);
             }
+          }
 
-            console.log("FINAL LINKS:", serversLinks);
-
-            // =====================
-            // INSERT (NO DUPLICATES)
-            // =====================
-            if (serversLinks.length > 0) {
-              const values = serversLinks.map(link => [
-                episode.id,
-                link,
-                episode.animeId,
-              ]);
-
-              const query = `
-                INSERT IGNORE INTO servers (episodeId, serverLink, animeId)
-                VALUES ?
-              `;
-
-              db.query(query, [values], err => {
-                if (err) console.error("Insert error:", err);
-                else console.log(`Inserted ${values.length} links`);
-              });
-            }
-
-            // =====================
-            // MARK AS SCRAPED
-            // =====================
-            
-
-            await page.close();
-
-            // small delay to prevent CPU spike
-            await new Promise(r => setTimeout(r, 800));
-          } catch (error) {
-            console.error(
-              "Scrape error:",
+          // =====================
+          // INSERT DB (SAFE)
+          // =====================
+          if (serversLinks.length > 0) {
+            const values = serversLinks.map(link => [
+              episode.id,
+              link,
               episode.animeId,
-              error.message
-            );
+            ]);
 
-            if (page) await page.close();
+            db.query(
+              "INSERT IGNORE INTO servers (episodeId, serverLink, animeId) VALUES ?",
+              [values],
+              err => {
+                if (err) console.error("Insert error:", err.message);
+              }
+            );
+          }
+
+          await page.close();
+
+          // small delay (prevents CPU spike)
+          await new Promise(r => setTimeout(r, 800));
+        } catch (error) {
+          console.error("Scrape error:", error.message);
+
+          if (page) {
+            try {
+              await page.close();
+            } catch {}
+          }
+
+          // if browser crashed → restart it
+          if (error.message.includes("Target browser")) {
+            browserReady = false;
+            initBrowser();
           }
         }
-
-        console.log("Scraping batch completed");
-        isScraping = false;
       }
-    );
+
+      console.log("Scraping batch completed");
+      isScraping = false;
+    });
   } catch (err) {
-    console.error("Fatal scrape error:", err);
+    console.error("Fatal scrape error:", err.message);
     isScraping = false;
   }
 }
@@ -217,29 +227,34 @@ async function scrapeEpisodes() {
 // =====================
 // API ROUTES
 // =====================
-
-// trigger scraper (NON-BLOCKING)
 app.get("/scrape", (req, res) => {
   scrapeEpisodes();
 
-  res.json({
+  return res.json({
     success: true,
     message: "Scraping started in background 🚀",
   });
 });
 
-// status endpoint
 app.get("/status", (req, res) => {
   res.json({
     scraping: isScraping,
+    browserReady,
   });
 });
 
 // =====================
-// START SERVER
+// HEALTH CHECK (IMPORTANT FOR RAILWAY)
+// =====================
+app.get("/", (req, res) => {
+  res.send("OK");
+});
+
+// =====================
+// START SERVER (CRITICAL FIX)
 // =====================
 const PORT = process.env.PORT || 3000;
 
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+app.listen(PORT, "0.0.0.0", () => {
+  console.log("Server running on port", PORT);
 });
