@@ -2,12 +2,8 @@ const express = require("express");
 const { chromium } = require("playwright");
 const mysql = require("mysql2");
 
-
- 
-
 const app = express();
 app.use(express.json());
-
 
 const db = mysql.createConnection({
   host: process.env.MYSQLHOST,
@@ -24,23 +20,42 @@ db.connect(err => {
   console.log("Connected to MySQL");
 });
 
-// 👉 SCRAPER FUNCTION (separated logic)
-async function scrapeEpisodes() {
-  return new Promise((resolve, reject) => {
-    db.query("SELECT * FROM episodes", async (err, results) => {
-      if (err) return reject(err);
+// ✅ GLOBAL BROWSER (reused)
+let browser;
+let isScraping = false;
 
-      const browser = await chromium.launch({
-  headless: true,
-  args: ["--no-sandbox", "--disable-setuid-sandbox"]
-});   
+(async () => {
+  browser = await chromium.launch({
+    headless: true,
+    args: ["--no-sandbox", "--disable-setuid-sandbox"]
+  });
+  console.log("Browser launched");
+})();
+
+// 👉 SCRAPER FUNCTION
+async function scrapeEpisodes() {
+  if (isScraping) {
+    console.log("Scraper already running...");
+    return;
+  }
+
+  isScraping = true;
+
+  try {
+    db.query("SELECT * FROM episodes", async (err, results) => {
+      if (err) {
+        console.error(err);
+        isScraping = false;
+        return;
+      }
+
       const page = await browser.newPage();
 
       for (const episode of results) {
         console.log(`Scraping anime ${episode.animeId} | ${episode.episodeHref}`);
 
         try {
-          await page.goto(episode.episodeHref, { waitUntil: "networkidle" });
+          await page.goto(episode.episodeHref, { waitUntil: "domcontentloaded" });
 
           await page.waitForSelector("#episode-servers > li", { timeout: 10000 });
 
@@ -52,8 +67,6 @@ async function scrapeEpisodes() {
           let serversLinks = [];
 
           for (let i = 0; i < serverCount; i++) {
-            console.log(`Clicking server ${i + 1}`);
-
             const servers = await page.$$("#episode-servers > li");
             await servers[i].click();
 
@@ -65,8 +78,7 @@ async function scrapeEpisodes() {
             const frame = await frameHandle?.contentFrame();
             if (!frame) continue;
 
-            await frame.waitForLoadState?.("networkidle").catch(() => {});
-            await frame.waitForTimeout(2000);
+            await frame.waitForTimeout(1500);
 
             const playerSelector =
               "#PlayerDisplay > div.OptionsLangDisp > div > div > li";
@@ -74,8 +86,6 @@ async function scrapeEpisodes() {
             const hasList = await frame.$(playerSelector);
 
             if (hasList) {
-              await frame.waitForSelector(playerSelector);
-
               const encodedList = await frame.$$eval(playerSelector, items =>
                 items
                   .map(item => {
@@ -94,17 +104,13 @@ async function scrapeEpisodes() {
 
               serversLinks.push(...decodedList);
             } else {
-              const videoSelector = "video";
-
-              await frame.waitForSelector(videoSelector, { timeout: 10000 }).catch(() => null);
-
               const videoLink = await frame
-                .$eval(videoSelector, video =>
+                .$eval("video", video =>
                   video.src || video.currentSrc || video.getAttribute("src")
                 )
                 .catch(() => null);
 
-              serversLinks.push(videoLink);
+              if (videoLink) serversLinks.push(videoLink);
             }
           }
 
@@ -125,28 +131,39 @@ async function scrapeEpisodes() {
               else console.log(`Inserted ${values.length} links`);
             });
           }
+
         } catch (error) {
           console.error("Scrape error:", episode.animeId, error.message);
         }
       }
 
-      await browser.close();
-      resolve("Scraping completed");
+      await page.close();
+      console.log("✅ Scraping completed");
+      isScraping = false;
     });
-  });
+
+  } catch (err) {
+    console.error("Fatal scrape error:", err);
+    isScraping = false;
+  }
 }
 
-// 👉 ROUTE TO TRIGGER SCRAPING
-app.get("/scrape", async (req, res) => {
-  try {
-    const result = await scrapeEpisodes();
-    res.json({ success: true, message: result });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ success: false, error: error.message });
-  }
+// 👉 ROUTE (NON-BLOCKING)
+app.get("/scrape", (req, res) => {
+  scrapeEpisodes(); // run in background
+
+  res.json({
+    success: true,
+    message: "Scraping started in background 🚀"
+  });
 });
 
+// OPTIONAL: status route
+app.get("/status", (req, res) => {
+  res.json({
+    scraping: isScraping
+  });
+});
 
 const PORT = 3000;
 app.listen(PORT, () => {
