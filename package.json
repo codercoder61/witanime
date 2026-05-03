@@ -20,7 +20,7 @@
     "cheerio": "^1.2.0",
     "mysql2": "^3.22.3",
     "express": "^5.2.1",
-    "playwright": "^1.40.0"
-    "cors": "^2.8.6",
+    "playwright": "^1.40.0",
+    "cors": "^2.8.6"
   }
 }
