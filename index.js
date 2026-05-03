@@ -1,10 +1,10 @@
 const express = require("express");
 const { chromium } = require("playwright");
 const mysql = require("mysql2");
-
+const cors = require("cors");
 const app = express();
 app.use(express.json());
-
+app.use(cors());
 const PORT = process.env.PORT || 3000;
 
 // =====================
@@ -28,150 +28,109 @@ db.connect(err => {
 // =====================
 // SCRAPER LOCK
 // =====================
-let isScraping = false;
 
 // =====================
 // SCRAPER
 // =====================
-async function runScraper() {
-  if (isScraping) {
-    console.log("Scraper already running...");
-    return;
-  }
-
-  isScraping = true;
-
-  let browser;
-
-  try {
-    console.log("Starting scraper...");
-
-    browser = await chromium.launch({
-      headless: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox"],
-    });
-
-    const page = await browser.newPage();
-
-    const results = await new Promise((resolve, reject) => {
-      db.query("SELECT * FROM episodes", (err, rows) => {
-        if (err) reject(err);
-        else resolve(rows);
-      });
-    });
-
-    for (const episode of results) {
-      console.log(`Scraping ${episode.animeId} | ${episode.episodeHref}`);
-
-      try {
-        await page.goto(episode.episodeHref, { waitUntil: "networkidle" });
-
-        await page.waitForSelector("#episode-servers > li", { timeout: 15000 });
-
-        const serverCount = await page.$$eval(
-          "#episode-servers > li",
-          els => els.length
-        );
-
-        let serversLinks = [];
-
-        for (let i = 0; i < serverCount; i++) {
-          const servers = await page.$$("#episode-servers > li");
-          await servers[i].click();
-
-          await page.waitForSelector("#iframe-container > iframe", {
-            timeout: 15000,
-          });
-
-          const frameHandle = await page.$("#iframe-container > iframe");
-          const frame = await frameHandle?.contentFrame();
-          if (!frame) continue;
-
-          await frame.waitForTimeout(2000);
-
-          const playerSelector =
-            "#PlayerDisplay > div.OptionsLangDisp > div > div > li";
-
-          const hasList = await frame.$(playerSelector);
-
-          if (hasList) {
-            const encodedList = await frame.$$eval(playerSelector, items =>
-              items
-                .map(item => {
-                  const onclick = item.getAttribute("onclick");
-                  if (!onclick) return null;
-
-                  const match = onclick.match(/go_to_player\('([^']+)'\)/);
-                  return match ? match[1] : null;
-                })
-                .filter(Boolean)
-            );
-
-            const decodedList = encodedList.map(encoded =>
-              Buffer.from(encoded, "base64").toString("utf-8")
-            );
-
-            serversLinks.push(...decodedList);
-          } else {
-            const videoLink = await frame
-              .$eval("video", video =>
-                video.src || video.currentSrc || video.getAttribute("src")
-              )
-              .catch(() => null);
-
-            if (videoLink) serversLinks.push(videoLink);
-          }
-        }
-
-        console.log("FINAL LINKS:", serversLinks);
-
-        if (serversLinks.length > 0) {
-          const values = serversLinks.map(link => [
-            episode.id,
-            link,
-            episode.animeId,
-          ]);
-
-          db.query(
-            "INSERT INTO servers (episodeId, serverLink, animeId) VALUES ?",
-            [values],
-            err => {
-              if (err) console.error("Insert error:", err);
-              else console.log(`Inserted ${values.length} links`);
-            }
-          );
-        }
-      } catch (err) {
-        console.error("Scrape error:", episode.animeId, err.message);
-      }
-    }
-
-    console.log("Scraping finished.");
-  } catch (err) {
-    console.error("Fatal scraper error:", err);
-  } finally {
-    if (browser) await browser.close();
-    isScraping = false;
-  }
-}
-
-// =====================
-// ROUTES
-// =====================
 
 app.get("/", (req, res) => {
-  res.send("Scraper server is running 🚀");
+  res.send("Welcome to server");
 });
 
-app.get("/scrape", (req, res) => {
-  runScraper();
-  res.json({ status: "Scraping started" });
+
+
+
+app.get("/api/animes/search", (req, res) => {
+  const q = req.query.q;
+
+  if (!q) {
+    return res.status(400).json({ error: "Query is required" });
+  }
+
+  const sql = `
+    SELECT id, title, animePoster, description, genres
+    FROM animes
+    WHERE title LIKE ?
+    LIMIT 20
+  `;
+
+  db.query(sql, [`%${q}%`], (err, results) => {
+    if (err) return res.status(500).json(err);
+
+    res.json(results);
+  });
 });
 
-app.get("/scrape-once", async (req, res) => {
-  await runScraper();
-  res.json({ status: "Scraping finished" });
+
+app.get("/api/animes/all", (req, res) => {
+  const sql = `
+    SELECT id, title, animePoster, description, genres
+    FROM animes
+    ORDER BY id DESC
+  `;
+
+  db.query(sql, (err, results) => {
+    if (err) {
+      console.error("DB error:", err);
+      return res.status(500).json({
+        success: false,
+        message: "Database error",
+      });
+    }
+
+    res.json({
+      success: true,
+      data: results,
+    });
+  });
 });
+
+app.get("/api/animes/:id", (req, res) => {
+  const animeId = req.params.id;
+
+  const animeQuery = `
+    SELECT * FROM animes WHERE id = ?
+  `;
+
+  const episodesQuery = `
+    SELECT id, animeId
+    FROM episodes
+    WHERE animeId = ?
+    ORDER BY id ASC
+  `;
+
+  db.query(animeQuery, [animeId], (err, animeResult) => {
+    if (err) return res.status(500).json(err);
+    if (animeResult.length === 0)
+      return res.status(404).json({ error: "Anime not found" });
+
+    db.query(episodesQuery, [animeId], (err, episodesResult) => {
+      if (err) return res.status(500).json(err);
+
+      res.json({
+        anime: animeResult[0],
+        episodes: episodesResult,
+      });
+    });
+  });
+});
+
+app.get("/api/episodes/:episodeId/servers", (req, res) => {
+  const episodeId = req.params.episodeId;
+
+  const sql = `
+    SELECT id, serverLink
+    FROM servers
+    WHERE episodeId = ?
+  `;
+
+  db.query(sql, [episodeId], (err, results) => {
+    if (err) return res.status(500).json(err);
+
+    res.json(results);
+  });
+});
+
 
 // =====================
 // START SERVER
